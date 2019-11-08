@@ -125,7 +125,7 @@ recover(VHost) ->
     AllClassic = find_local_durable_classic_queues(VHost),
     Quorum = find_local_quorum_queues(VHost),
     {RecoveredClassic, FailedClassic} = recover_classic_queues(VHost, AllClassic),
-    {RecoveredClassic, FailedClassic, rabbit_quorum_queue:recover(Quorum)}.
+    {RecoveredClassic, FailedClassic, rabbit_ra_queue:recover(Quorum)}.
 
 recover_classic_queues(VHost, Queues) ->
     {ok, BQ} = application:get_env(rabbit, backing_queue_module),
@@ -199,7 +199,7 @@ find_local_quorum_queues(VHost) ->
       fun () ->
               qlc:e(qlc:q([Q || Q <- mnesia:table(rabbit_durable_queue),
                                 amqqueue:get_vhost(Q) =:= VHost,
-                                amqqueue:is_quorum(Q) andalso
+                                (amqqueue:is_quorum(Q) orelse amqqueue:is_stream(Q)) andalso
                                 (lists:member(Node, get_quorum_nodes(Q)))]))
       end).
 
@@ -281,9 +281,9 @@ declare(QueueName = #resource{virtual_host = VHost}, Durable, AutoDelete, Args,
         Owner, ActingUser, Node) ->
     ok = check_declare_arguments(QueueName, Args),
     Type = get_queue_type(Args),
-    TypeIsAllowed =
-      Type =:= rabbit_classic_queue orelse
-      rabbit_feature_flags:is_enabled(quorum_queue),
+    TypeIsAllowed = true,
+      % Type =:= rabbit_classic_queue orelse
+      % rabbit_feature_flags:is_enabled(quorum_queue),
     case TypeIsAllowed of
         true ->
             Q0 = amqqueue:new(QueueName,
@@ -309,7 +309,9 @@ declare(QueueName = #resource{virtual_host = VHost}, Durable, AutoDelete, Args,
 do_declare(Q, Node) when ?amqqueue_is_classic(Q) ->
     declare_classic_queue(Q, Node);
 do_declare(Q, _Node) when ?amqqueue_is_quorum(Q) ->
-    rabbit_quorum_queue:declare(Q).
+    rabbit_quorum_queue:declare(Q);
+do_declare(Q, _Node) when ?amqqueue_is_stream(Q) ->
+    rabbit_stream_queue:declare(Q).
 
 declare_classic_queue(Q, Node) ->
     QName = amqqueue:get_name(Q),
@@ -346,7 +348,9 @@ get_queue_type(Args) ->
                 <<"quorum">> ->
                     rabbit_quorum_queue;
                 <<"classic">> ->
-                    rabbit_classic_queue
+                    rabbit_classic_queue;
+                <<"stream">> ->
+                    rabbit_stream_queue
             end
     end.
 
@@ -832,7 +836,8 @@ declare_args() ->
      {<<"x-queue-type">>,              fun check_queue_type/2},
      {<<"x-quorum-initial-group-size">>,     fun check_default_quorum_initial_group_size_arg/2}].
 
-consume_args() -> [{<<"x-priority">>,              fun check_int_arg/2},
+consume_args() -> [{<<"x-stream-offset">>,         fun check_int_arg/2},
+                   {<<"x-priority">>,              fun check_int_arg/2},
                    {<<"x-cancel-on-ha-failover">>, fun check_bool_arg/2}].
 
 check_int_arg({Type, _}, _) ->
@@ -916,7 +921,9 @@ check_queue_mode({Type,    _}, _Args) ->
     {error, {unacceptable_type, Type}}.
 
 check_queue_type({longstr, Val}, _Args) ->
-    case lists:member(Val, [<<"classic">>, <<"quorum">>]) of
+    case lists:member(Val, [<<"classic">>,
+                            <<"quorum">>,
+                            <<"stream">>]) of
         true  -> ok;
         false -> {error, invalid_queue_type}
     end;
@@ -1373,6 +1380,7 @@ get_queue_consumer_info(Q, ConsumerInfoKeys) ->
           {'ok', non_neg_integer(), non_neg_integer()}.
 
 stat(Q) when ?amqqueue_is_quorum(Q) -> rabbit_quorum_queue:stat(Q);
+stat(Q) when ?amqqueue_is_stream(Q) -> {ok, 0, 0};
 stat(Q) -> delegate:invoke(amqqueue:get_pid(Q), {gen_server2, call, [stat, infinity]}).
 
 -spec pid_of(amqqueue:amqqueue()) ->
@@ -1423,9 +1431,10 @@ delete_immediately_by_resource(Resources) ->
             rabbit_types:error('in_use') |
             rabbit_types:error('not_empty').
 
-delete(Q,
-       IfUnused, IfEmpty, ActingUser) when ?amqqueue_is_quorum(Q) ->
+delete(Q, IfUnused, IfEmpty, ActingUser) when ?amqqueue_is_quorum(Q) ->
     rabbit_quorum_queue:delete(Q, IfUnused, IfEmpty, ActingUser);
+delete(Q, _IfUnused, _IfEmpty, ActingUser) when ?amqqueue_is_stream(Q) ->
+    rabbit_stream_queue:delete(Q, ActingUser);
 delete(Q, IfUnused, IfEmpty, ActingUser) ->
     case wait_for_promoted_or_stopped(Q) of
         {promoted, Q1} ->
@@ -1539,6 +1548,15 @@ ack(QPid, {_, MsgIds}, ChPid, QueueStates) when ?IS_CLASSIC(QPid) ->
 ack({Name, _} = QPid, {CTag, MsgIds}, _ChPid, QuorumStates)
   when ?IS_QUORUM(QPid) ->
     case QuorumStates of
+        #{Name := QState0}
+          when element(1, QState0) == stream_client ->
+            %% Streams just take the max acked rather than a list
+            %% non-consecutive acking behaviour is currently undefined
+            %% REALLY we should mandate multiple=true or ack a count
+            %% rather than an explicit msgid
+            {ok, QState} = rabbit_stream_queue:credit(QState0, CTag,
+                                                      length(MsgIds)),
+            maps:put(Name, QState, QuorumStates);
         #{Name := QState0} ->
             {ok, QState} = rabbit_quorum_queue:ack(CTag, MsgIds, QState0),
             maps:put(Name, QState, QuorumStates);
@@ -1619,9 +1637,9 @@ credit(Q, ChPid, CTag, Credit,
 credit(Q,
        _ChPid, CTag, Credit,
        Drain, QStates) when ?amqqueue_is_quorum(Q) ->
-    {Name, _} = Id = amqqueue:get_pid(Q),
+    {Name, _} = amqqueue:get_pid(Q),
     QName = amqqueue:get_name(Q),
-    QState0 = get_quorum_state(Id, QName, QStates),
+    QState0 = get_queue_client_state(Q, QName, QStates),
     {ok, QState} = rabbit_quorum_queue:credit(CTag, Credit, Drain, QState0),
     {ok, maps:put(Name, QState, QStates)}.
 
@@ -1638,9 +1656,9 @@ basic_get(Q, ChPid, NoAck, LimiterPid, _CTag, _)
                            [{basic_get, ChPid, NoAck, LimiterPid}, infinity]});
 basic_get(Q, _ChPid, NoAck, _LimiterPid, CTag, QStates)
   when ?amqqueue_is_quorum(Q) ->
-    {Name, _} = Id = amqqueue:get_pid(Q),
+    {Name, _} = amqqueue:get_pid(Q),
     QName = amqqueue:get_name(Q),
-    QState0 = get_quorum_state(Id, QName, QStates),
+    QState0 = get_queue_client_state(Q, QName, QStates),
     case rabbit_quorum_queue:basic_get(Q, NoAck, CTag, QState0) of
         {ok, empty, QState} ->
             {empty, maps:put(Name, QState, QStates)};
@@ -1682,6 +1700,31 @@ basic_consume(Q, _NoAck, _ChPid,
   when ?amqqueue_is_quorum(Q) ->
     {error, global_qos_not_supported_for_queue_type};
 basic_consume(Q,
+              _NoAck, ChPid, _LimiterPid, _LimiterActive, ConsumerPrefetchCount,
+              ConsumerTag, _ExclusiveConsume, Args, OkMsg,
+              _ActingUser, QStates)
+  when ?amqqueue_is_stream(Q) ->
+    {Name, _} = amqqueue:get_pid(Q),
+    QName = amqqueue:get_name(Q),
+    rabbit_log:info("basic_consume stream args ~w ~w",
+                    [Args, ConsumerPrefetchCount]),
+    ok = check_consume_arguments(QName, Args),
+    QState0 = get_queue_client_state(Q, QName, QStates),
+    Offset = case rabbit_misc:table_lookup(Args, <<"x-stream-offset">>) of
+                 undefined ->
+                     undefined;
+                 {_, V} ->
+                     V
+             end,
+
+    %% FIXME: reply needs to be sent before the stream begins sending
+    %% really it should be sent by the stream queue process like classic queues
+    %% do
+    maybe_send_reply(ChPid, OkMsg),
+    QState = rabbit_stream_queue:begin_stream(QState0, ConsumerTag, Offset,
+                                              ConsumerPrefetchCount),
+    {ok, maps:put(Name, QState, QStates)};
+basic_consume(Q,
               NoAck, ChPid, _LimiterPid, _LimiterActive, ConsumerPrefetchCount,
               ConsumerTag, ExclusiveConsume, Args, OkMsg,
               ActingUser, QStates)
@@ -1689,7 +1732,7 @@ basic_consume(Q,
     {Name, _} = Id = amqqueue:get_pid(Q),
     QName = amqqueue:get_name(Q),
     ok = check_consume_arguments(QName, Args),
-    QState0 = get_quorum_state(Id, QName, QStates),
+    QState0 = get_queue_client_state(Id, QName, QStates),
     case rabbit_quorum_queue:basic_consume(Q, NoAck, ChPid,
                                            ConsumerPrefetchCount,
                                            ConsumerTag,
@@ -1709,12 +1752,12 @@ basic_consume(Q,
          rabbit_types:username(), #{Name :: atom() => rabbit_fifo_client:state()}) ->
                           'ok' | {'ok', #{Name :: atom() => rabbit_fifo_client:state()}}.
 
-basic_cancel(Q, ChPid, ConsumerTag, OkMsg, ActingUser,
-             QState)
+basic_cancel(Q, ChPid, ConsumerTag, OkMsg, ActingUser, QState)
   when ?amqqueue_is_classic(Q) ->
     QPid = amqqueue:get_pid(Q),
     case delegate:invoke(QPid, {gen_server2, call,
-                                [{basic_cancel, ChPid, ConsumerTag, OkMsg, ActingUser},
+                                [{basic_cancel, ChPid, ConsumerTag, OkMsg,
+                                  ActingUser},
                                  infinity]}) of
         ok ->
             {ok, QState};
@@ -1724,8 +1767,16 @@ basic_cancel(Q, ChPid,
              ConsumerTag, OkMsg, _ActingUser, QStates)
   when ?amqqueue_is_quorum(Q) ->
     {Name, _} = Id = amqqueue:get_pid(Q),
-    QState0 = get_quorum_state(Id, QStates),
+    QState0 = get_queue_client_state(Id, QStates),
     {ok, QState} = rabbit_quorum_queue:basic_cancel(ConsumerTag, ChPid, OkMsg, QState0),
+    {ok, maps:put(Name, QState, QStates)};
+basic_cancel(Q, ChPid,
+             ConsumerTag, OkMsg, _ActingUser, QStates)
+  when ?amqqueue_is_stream(Q) ->
+    {Name, _} = Id = amqqueue:get_pid(Q),
+    QState0 = get_queue_client_state(Id, QStates),
+    QState = rabbit_stream_queue:end_stream(QState0, ConsumerTag),
+    maybe_send_reply(ChPid, OkMsg),
     {ok, maps:put(Name, QState, QStates)}.
 
 -spec notify_decorators(amqqueue:amqqueue()) -> 'ok'.
@@ -2101,14 +2152,25 @@ deliver(Qs, Delivery = #delivery{flow = Flow,
                 untracked;
             _ ->
                 lists:foldl(
-                  fun({{Name, _} = Pid, QName}, QStates) ->
-                          QState0 = get_quorum_state(Pid, QName, QStates),
-                          case rabbit_quorum_queue:deliver(Confirm, Delivery,
-                                                           QState0) of
-                              {ok, QState} ->
+                  fun({{Name, _}, Q}, QStates) ->
+                          QState0 = get_queue_client_state(Q,
+                                                           amqqueue:get_name(Q), QStates),
+                          case element(1, QState0) of
+                              stream_client ->
+                                  MsgId = Delivery#delivery.msg_seq_no,
+                                  Msg = Delivery#delivery.message,
+                                  QState = rabbit_stream_queue:append(QState0,
+                                                                      MsgId,
+                                                                      Msg),
                                   maps:put(Name, QState, QStates);
-                              {slow, QState} ->
-                                  maps:put(Name, QState, QStates)
+                              _ ->
+                                  case rabbit_quorum_queue:deliver(Confirm, Delivery,
+                                                                   QState0) of
+                                      {ok, QState} ->
+                                          maps:put(Name, QState, QStates);
+                                      {slow, QState} ->
+                                          maps:put(Name, QState, QStates)
+                                  end
                           end
                   end, QueueState0, Quorum)
         end,
@@ -2116,22 +2178,22 @@ deliver(Qs, Delivery = #delivery{flow = Flow,
     {QPids, QuorumPids, QueueState}.
 
 qpids([]) -> {[], [], []}; %% optimisation
-qpids([Q]) when ?amqqueue_is_quorum(Q) ->
-    QName = amqqueue:get_name(Q),
-    {LocalName, LeaderNode} = amqqueue:get_pid(Q),
-    {[{{LocalName, LeaderNode}, QName}], [], []}; %% opt
-qpids([Q]) ->
-    QPid = amqqueue:get_pid(Q),
-    SPids = amqqueue:get_slave_pids(Q),
-    {[], [QPid], SPids}; %% opt
+% qpids([Q]) when ?amqqueue_is_quorum(Q) ->
+%     QName = amqqueue:get_name(Q),
+%     {LocalName, LeaderNode} = amqqueue:get_pid(Q),
+%     {[{{LocalName, LeaderNode}, QName}], [], []}; %% opt
+% qpids([Q]) ->
+%     QPid = amqqueue:get_pid(Q),
+%     SPids = amqqueue:get_slave_pids(Q),
+%     {[], [QPid], SPids}; %% opt
 qpids(Qs) ->
     {QuoPids, MPids, SPids} =
         lists:foldl(fun (Q,
                          {QuoPidAcc, MPidAcc, SPidAcc})
-                          when ?amqqueue_is_quorum(Q) ->
+                          when ?amqqueue_is_quorum(Q) orelse
+                               ?amqqueue_is_stream(Q) ->
                             QPid = amqqueue:get_pid(Q),
-                            QName = amqqueue:get_name(Q),
-                            {[{QPid, QName} | QuoPidAcc], MPidAcc, SPidAcc};
+                            {[{QPid, Q} | QuoPidAcc], MPidAcc, SPidAcc};
                         (Q,
                          {QuoPidAcc, MPidAcc, SPidAcc}) ->
                             QPid = amqqueue:get_pid(Q),
@@ -2140,14 +2202,25 @@ qpids(Qs) ->
                     end, {[], [], []}, Qs),
     {QuoPids, MPids, lists:append(SPids)}.
 
-get_quorum_state({Name, _} = Id, QName, Map) ->
+get_queue_client_state(Q, QName, Map)
+  when ?amqqueue_is_quorum(Q)->
+    {Name, _} = Id = amqqueue:get_pid(Q),
     case maps:find(Name, Map) of
         {ok, S} -> S;
         error ->
             rabbit_quorum_queue:init_state(Id, QName)
+    end;
+get_queue_client_state(Q, QName, Map)
+  when ?amqqueue_is_stream(Q)->
+    {Name, _} = amqqueue:get_pid(Q),
+    case maps:find(Name, Map) of
+        {ok, S} -> S;
+        error ->
+            ServerIds = [{Name, N} || N <- maps:get(nodes, amqqueue:get_type_state(Q))],
+            rabbit_stream_queue:init_client(QName, ServerIds)
     end.
 
-get_quorum_state({Name, _}, Map) ->
+get_queue_client_state({Name, _}, Map) ->
     maps:get(Name, Map).
 
 get_quorum_nodes(Q) when ?is_amqqueue(Q) ->
@@ -2157,3 +2230,6 @@ get_quorum_nodes(Q) when ?is_amqqueue(Q) ->
         _ ->
             []
     end.
+
+maybe_send_reply(_ChPid, undefined) -> ok;
+maybe_send_reply(ChPid, Msg) -> ok = rabbit_channel:send_command(ChPid, Msg).

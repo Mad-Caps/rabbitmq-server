@@ -647,7 +647,7 @@ handle_aux(_, cast, Cmd, {Name, Use0}, Log, _) ->
                   true = ets:insert(rabbit_fifo_usage,
                                     {Name, utilisation(Use0)}),
                   Use0;
-              eval ->
+              _ ->
                   Use0
           end,
     {no_reply, {Name, Use}, Log}.

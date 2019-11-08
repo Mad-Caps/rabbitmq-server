@@ -41,7 +41,9 @@
          grow/4]).
 -export([transfer_leadership/2, get_replicas/1, queue_length/1]).
 -export([file_handle_leader_reservation/1, file_handle_other_reservation/0]).
--export([file_handle_release_reservation/0]).
+-export([file_handle_release_reservation/0,
+         make_ra_conf/4
+         ]).
 -export([list_with_minimum_quorum/0, list_with_minimum_quorum_for_cli/0,
          filter_quorum_critical/1, filter_quorum_critical/2,
          all_replica_states/0]).
@@ -125,9 +127,10 @@ declare(Q) when ?amqqueue_is_quorum(Q) ->
     NewQ1 = amqqueue:set_type_state(NewQ0, #{nodes => Nodes}),
     case rabbit_amqqueue:internal_declare(NewQ1, false) of
         {created, NewQ} ->
+            ServerIds = members(NewQ),
             TickTimeout = application:get_env(rabbit, quorum_tick_interval, ?TICK_TIMEOUT),
-            RaConfs = [make_ra_conf(NewQ, ServerId, TickTimeout)
-                       || ServerId <- members(NewQ)],
+            RaConfs = [make_ra_conf(NewQ, ServerId, ServerIds, TickTimeout)
+                       || ServerId <- ServerIds],
             case ra:start_cluster(RaConfs) of
                 {ok, _, _} ->
                     rabbit_event:notify(queue_created,
@@ -324,7 +327,6 @@ handle_tick(QName,
                                {message_bytes, MsgBytesReady + MsgBytesUnack},
                                {message_bytes_persistent, MsgBytesReady + MsgBytesUnack},
                                {messages_persistent, M}
-
                                | infos(QName, ?STATISTICS_KEYS -- [consumers])],
                       rabbit_core_metrics:queue_stats(QName, Infos),
                       rabbit_event:notify(queue_stats,
@@ -393,7 +395,8 @@ recover(Queues) ->
                  % so needs to be started from scratch.
                  TickTimeout = application:get_env(rabbit, quorum_tick_interval,
                                                    ?TICK_TIMEOUT),
-                 Conf = make_ra_conf(Q0, {Name, node()}, TickTimeout),
+                 ServerIds = members(Q0),
+                 Conf = make_ra_conf(Q0, {Name, node()}, ServerIds, TickTimeout),
                  case ra:start_server(Conf) of
                      ok ->
                          ok;
@@ -546,7 +549,8 @@ basic_get(Q, NoAck, CTag0, QState0) when ?amqqueue_is_quorum(Q) ->
                        _ -> 0
                     end,
             IsDelivered = Count > 0,
-            Msg = rabbit_basic:add_header(<<"x-delivery-count">>, long, Count, Msg0),
+            Msg = rabbit_basic:add_header(<<"x-delivery-count">>, long,
+                                          Count, Msg0),
             {ok, MsgsReady, {QName, Id, MsgId, IsDelivered, Msg}, QState};
         {error, unsupported} ->
             rabbit_misc:protocol_error(
@@ -823,7 +827,7 @@ add_member(Q, Node, Timeout) when ?amqqueue_is_quorum(Q) ->
     Members = members(Q),
     TickTimeout = application:get_env(rabbit, quorum_tick_interval,
                                       ?TICK_TIMEOUT),
-    Conf = make_ra_conf(Q, ServerId, TickTimeout),
+    Conf = make_ra_conf(Q, ServerId, Members, TickTimeout),
     case ra:start_server(Conf) of
         ok ->
             case ra:add_member(Members, ServerId, Timeout) of
@@ -1316,10 +1320,10 @@ members(Q) when ?amqqueue_is_quorum(Q) ->
     Nodes = lists:delete(LeaderNode, get_nodes(Q)),
     [{RaName, N} || N <- [LeaderNode | Nodes]].
 
-make_ra_conf(Q, ServerId, TickTimeout) ->
+make_ra_conf(Q, ServerId, ServerIds, TickTimeout) ->
     QName = amqqueue:get_name(Q),
     RaMachine = ra_machine(Q),
-    [{ClusterName, _} | _] = Members = members(Q),
+    [{ClusterName, _} | _] = Members = ServerIds,
     UId = ra:new_uid(ra_lib:to_binary(ClusterName)),
     FName = rabbit_misc:rs(QName),
     #{cluster_name => ClusterName,

@@ -1568,6 +1568,10 @@ end}.
 %% Ra
 %%
 
+{mapping, "raft.wal_data_dir", "ra.wal_data_dir", [
+  {datatype, string},
+  {validators, ["dir_writable"]}]}.
+
 {mapping, "raft.segment_max_entries", "ra.segment_max_entries", [
   {datatype, integer},
   {validators, ["non_zero_positive_integer"]}
